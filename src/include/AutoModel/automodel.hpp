@@ -124,6 +124,8 @@ struct chat_meta_info_t {
     uint64_t decoding_duration; // in nanoseconds
     stop_reason_t stop_reason;
 	bool restore_allowed;
+	/// Opt-in independent request; the engine checkpoint belongs to the system prefix.
+	bool cache_system_prompt = false;
 	tool_choice_t tool_choice;
 
 	chat_meta_info_t() : max_prefill_len(0), prompt_tokens(0), cached_prompt_tokens(0), generated_tokens(0), total_duration(0), load_duration(0), prefill_duration(0), decoding_duration(0), stop_reason(EOT_DETECTED), restore_allowed(false), tool_choice(TOOL_CHOICE_AUTO) {}
@@ -186,6 +188,8 @@ protected:
 	std::unique_ptr<npu_xclbin_manager> npu = nullptr;
 	bool enable_preemption = false;
     std::vector<int> checkpoint_his;
+	std::vector<int> system_prompt_cache_tokens_;
+	bool system_prompt_cache_active_ = false;
 	/// \brief dump the undecorated model output to stdout once a turn ends
 	/// \note on by default; models whose turns are short and driven in bulk (the
 	///       hunyuan translator) turn it off so the log is not doubled. Those
@@ -303,6 +307,8 @@ protected:
 	/// \throws ModelRequestError 400 when prompt plus output cannot fit
 	void _shared_validate_capacity(std::size_t rendered_tokens, std::optional<int> requested) const;
 	buffer<bf16> _chunked_insert(chat_meta_info_t& meta_info, std::vector<int>& tokens, std::function<bool()> is_cancelled = [] { return false; }, void* payload = nullptr, int first_len_run = 0);
+	std::vector<int> _system_prompt_prefix(lm_uniform_input_t& input, const std::vector<int>& tokens);
+	bool _prepare_system_prompt_cache(chat_meta_info_t& meta_info, std::vector<int> prefix, std::function<bool()> is_cancelled);
 	std::string _shared_generate(chat_meta_info_t& meta_info, int length_limit, std::ostream& os, std::function<bool()> is_cancelled = [] { return false; });
 
 	/// \brief Push the tool start token out of contention before sampling.
@@ -333,6 +339,9 @@ public:
 
 	/// \brief Clear the context
 	virtual void clear_context();
+	/// Model wrappers opt in only after preserving the pin throughout generation.
+	virtual bool supports_system_prompt_cache() const { return false; }
+	bool has_system_prompt_cache() const { return system_prompt_cache_active_; }
 
 	/// \brief Mark this instance as running under `flm serve` (vs. `flm run`)
 	/// \param value true if running under `flm serve`

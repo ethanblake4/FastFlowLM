@@ -20,6 +20,7 @@ parent: Local Server (Server Mode)
   - [Example: Multi-Image Input](#-example-multi-image-input)   
   - [Example: Multi-Modal Input](#️-example-multi-modal-input)   
   - [Example: Flash Models (Single-Turn, Pinned System Prompt)](#-example-flash-models-single-turn-pinned-system-prompt)   
+  - [Independent requests with a cached system prefix](#independent-requests-with-a-cached-system-prefix)
 
 ---
 
@@ -485,3 +486,65 @@ gc.collect()
 > 🖼️ `gemma4e-flash` defaults to the smallest visual token budget (70) and keeps only the **first 30 seconds** of an audio clip. `qwen3vl-flash` always downscales images to a **256 px longer side**.  
 
 For the full per-model details, see the [`gemma4e-flash:e2b`](https://fastflowlm.com/docs/models/gemma/#-model-card-gemma-4-e2b-it--flash), [`gemma4e-flash:e4b`](https://fastflowlm.com/docs/models/gemma/#-model-card-gemma-4-e4b-it--flash), and [`qwen3vl-flash:4b`](https://fastflowlm.com/docs/models/qwen/#-model-card-qwen3-vl-4b-instruct--flash) model cards.
+
+---
+
+## Independent requests with a cached system prefix
+
+Regular Gemma 4 E2B/E4B models on the `flm` backend accept the opt-in OpenAI
+chat-completions extension `"cache_system_prompt": true`. Each request must
+contain exactly one text-only system message followed by one user message.
+The user message may contain images or audio. This mode keeps the regular
+model's context length, image budget, and thinking support; it does not select
+the Flash engine or apply Flash's limits.
+
+```python
+response = client.chat.completions.create(
+    model="gemma4-it:e2b",
+    messages=[
+        {"role": "system", "content": instructions_and_reference_data},
+        {"role": "user", "content": current_observation},
+    ],
+    extra_body={"cache_system_prompt": True, "think": True, "image-max-tokens": 560},
+)
+print(response.usage.prompt_tokens_details.cached_tokens)
+```
+
+The first request prefills and checkpoints the rendered system prefix. Later
+requests restore that checkpoint and prefill only the new user input. Previous
+user inputs, images, reasoning, and answers are discarded between requests.
+The cache key is the rendered prefix token sequence, including any tools or
+template settings that affect it. Changing that prefix rebuilds the cache.
+
+This is one checkpoint per loaded model, not a multi-entry cache or arbitrary
+partial-prefix reuse. Inference failures, explicit context clears, model reloads, and
+switching back to ordinary conversation requests invalidate it. Omitting the
+option or setting it to false restores the existing conversation behavior.
+Unsupported models and conversation-shaped requests return an invalid-request
+error. Flash models already implement their own prefix caching and do not need
+this option.
+
+`usage.prompt_tokens` includes the entire input. `cached_tokens` counts only
+tokens reused from a previous request; the first request reports zero. Prefill
+time includes building the system checkpoint on cold requests. Images and audio
+are processed on every request and are never part of the cached system prefix.
+
+Hardware-free validation tests:
+
+```sh
+cmake -S src/test/system_prompt_cache -B src/build/cache-tests
+cmake --build src/build/cache-tests --config Release
+ctest --test-dir src/build/cache-tests -C Release --output-on-failure
+```
+
+The live regression test requires a compatible NPU and downloaded regular Gemma
+weights. Run it against a dedicated server with an 8k context; it sends
+synthetic observations and clears context by switching request modes:
+
+```sh
+flm serve gemma4-it:e2b --ctx-len 8192
+python src/test/system_prompt_cache/test_server.py --base-url http://127.0.0.1:52625
+```
+
+Use `--image-format jpeg` to run the same regressions with JPEG fixtures instead
+of PNG. The FFmpeg build must include the selected image decoder.

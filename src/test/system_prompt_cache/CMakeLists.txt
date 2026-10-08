@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.22)
+project(system_prompt_cache_tests LANGUAGES CXX)
+add_executable(test_system_prompt_cache test_system_prompt_cache.cpp)
+target_compile_features(test_system_prompt_cache PRIVATE cxx_std_20)
+target_include_directories(test_system_prompt_cache PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../../include")
+enable_testing()
+add_test(NAME system_prompt_cache COMMAND test_system_prompt_cache)

@@ -954,6 +954,15 @@ bool Gemma4e::insert(chat_meta_info_t& meta_info, lm_uniform_input_t& input, std
     // images/audios so the surviving payload aligns with the surviving soft
     // tokens after _shared_insert performs its own erase.
     // ----------------------------------------------------------------------
+    uint64_t system_prefill_duration = 0;
+    int system_cached_tokens = 0;
+    if (meta_info.cache_system_prompt) {
+        if (!this->_prepare_system_prompt_cache(meta_info, this->_system_prompt_prefix(input, tokens), is_cancelled)) {
+            return false;
+        }
+        system_prefill_duration = meta_info.prefill_duration;
+        system_cached_tokens = meta_info.cached_prompt_tokens;
+    }
     size_t prefix_skip_count = 0;
     {
         const size_t idx = this->checkpoint_his.size();
@@ -1070,7 +1079,13 @@ bool Gemma4e::insert(chat_meta_info_t& meta_info, lm_uniform_input_t& input, std
         ? this->_shared_insert(meta_info, tokens, is_cancelled, &multi_modal_payload, last_image_token_index)
         : this->_shared_insert(meta_info, tokens, is_cancelled, nullptr);
 
-    if (this->enable_think) {
+    if (meta_info.cache_system_prompt) {
+        // _shared_insert sees the prefix on cold runs too, but those tokens
+        // were evaluated in THIS request. Only warm restores count as cached.
+        meta_info.cached_prompt_tokens = system_cached_tokens;
+        meta_info.prefill_duration += system_prefill_duration;
+    }
+    if (this->enable_think && !meta_info.cache_system_prompt) {
         checkpoint_his = token_history;
         int checkpoint_idx = this->lm_engine->checkpoint();
     }
@@ -1160,7 +1175,7 @@ std::string Gemma4e::generate(chat_meta_info_t& meta_info, int length_limit, std
     std::cout << std::endl;
     header_print("FLM", "Model RAW Output: \n" + result);
     
-    if (!this->enable_think) {
+    if (!this->enable_think && !meta_info.cache_system_prompt) {
         int checkpoint_idx = this->lm_engine->checkpoint();
         // copy the token history at the checkpoint except the last one token, which is the start token for generation and should not be included in the checkpoint history
         checkpoint_his = token_history;
@@ -1178,9 +1193,11 @@ std::string Gemma4e::generate_with_prompt(chat_meta_info_t& meta_info, lm_unifor
         os << "<think>\n" << std::flush;
     }
 
-    int checkpoint_idx = this->lm_engine->checkpoint();
-    int restore_idx = this->lm_engine->restore();
-    header_print_r("FLM", "Checkpoint before generation: " << checkpoint_idx << ", restore point: " << restore_idx << ", user context length: " << this->token_history.size());
+    if (!meta_info.cache_system_prompt) {
+        int checkpoint_idx = this->lm_engine->checkpoint();
+        int restore_idx = this->lm_engine->restore();
+        header_print_r("FLM", "Checkpoint before generation: " << checkpoint_idx << ", restore point: " << restore_idx << ", user context length: " << this->token_history.size());
+    }
     return this->_shared_generate(meta_info, length_limit, os);
 }
 

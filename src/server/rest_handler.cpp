@@ -7,6 +7,7 @@
  *  \version 0.9.24
  */
 #include "rest_handler.hpp"
+#include "system_prompt_cache.hpp"
 #include "wstream_buf.hpp"
 #include "streaming_ostream.hpp"
 #include "streaming_ostream_openai.hpp"
@@ -1152,6 +1153,17 @@ void RestHandler::handle_openai_chat_completion(const json& request,
         int length_limit = request.value("max_tokens", request.value("max_completion_tokens", 4096));
         json tools = request.value("tools", json::array());
         json options = request.value("options", json::object());
+        if (request.contains("cache_system_prompt") && !request["cache_system_prompt"].is_boolean()) {
+            throw ModelRequestError(400, false, "cache_system_prompt must be a boolean.");
+        }
+        const bool cache_system_prompt = request.value("cache_system_prompt", false);
+        if (cache_system_prompt) {
+            try {
+                flm::validate_system_prompt_cache_request(current_messages);
+            } catch (const std::exception& error) {
+                throw ModelRequestError(400, false, error.what());
+            }
+        }
 
         // Only "auto" and "none" are honoured; "required" and the per-function
         // object form are not implemented yet, and a request asking for one is
@@ -1173,6 +1185,14 @@ void RestHandler::handle_openai_chat_completion(const json& request,
         }
         auto load_end_time = time_utils::now();
 
+        if (cache_system_prompt && !auto_chat_engine->supports_system_prompt_cache()) {
+            throw ModelRequestError(400, false, "cache_system_prompt is not supported by this model.");
+        }
+        if (!cache_system_prompt && auto_chat_engine->has_system_prompt_cache()) {
+            auto_chat_engine->clear_context();
+            prompt_cache.reset();
+            model_used_for_last_message.clear();
+        }
         configure_chat_engine_parameters(options, request);
 
         current_messages = normalize_messages(current_messages);
@@ -1180,8 +1200,15 @@ void RestHandler::handle_openai_chat_completion(const json& request,
 
         // see if we can use prompt cache
         chat_meta_info_t meta_info;
+        meta_info.cache_system_prompt = cache_system_prompt;
         bool can_use_prompt_cache = false;
-        if (auto_chat_engine->single_turn) {
+        if (cache_system_prompt) {
+            // The wrapper owns the pinned checkpoint. Conversation checksums
+            // cannot describe it and must not survive a mode switch.
+            prompt_cache.reset();
+            model_used_for_last_message.clear();
+        }
+        else if (auto_chat_engine->single_turn) {
             // reject multi-turn requests: any assistant message in the history
             // means the caller is trying to continue a prior turn, which this
             // model cannot support.
@@ -1387,6 +1414,8 @@ void RestHandler::handle_openai_chat_completion(const json& request,
             send_response(response);
         }
 
+    } catch (const ModelRequestError& error) {
+        send_response(ModelErrorResponse(error));
     } catch (const std::exception& e) {
         json error_response = {
             {"error", {

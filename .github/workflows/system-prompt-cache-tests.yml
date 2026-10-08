@@ -1,0 +1,37 @@
+name: System prompt cache tests
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    paths:
+      - 'src/common/AutoModel/**'
+      - 'src/include/AutoModel/**'
+      - 'src/server/rest_handler.cpp'
+      - 'src/include/system_prompt_cache.hpp'
+      - 'src/test/system_prompt_cache/**'
+      - '.github/workflows/system-prompt-cache-tests.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'src/common/AutoModel/**'
+      - 'src/include/AutoModel/**'
+      - 'src/server/rest_handler.cpp'
+      - 'src/include/system_prompt_cache.hpp'
+      - 'src/test/system_prompt_cache/**'
+      - '.github/workflows/system-prompt-cache-tests.yml'
+  workflow_dispatch:
+
+jobs:
+  validation:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S src/test/system_prompt_cache -B src/build/cache-tests
+      - run: cmake --build src/build/cache-tests --config Release
+      - run: ctest --test-dir src/build/cache-tests -C Release --output-on-failure
+      - run: python -m py_compile src/test/system_prompt_cache/test_server.py

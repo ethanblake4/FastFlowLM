@@ -6,6 +6,7 @@
 /// \note This is a source file for the auto_model class
 
 #include "AutoModel/automodel.hpp"
+#include "system_prompt_cache.hpp"
 #include "utils/npu_platform.hpp"
 
 namespace {
@@ -187,6 +188,8 @@ void AutoModel::_shared_load_model(std::string model_path, json model_info, int 
 
 void AutoModel::_shared_initialize_model_state(
     std::string model_path, json, int context_length) {
+    system_prompt_cache_tokens_.clear();
+    system_prompt_cache_active_ = false;
     this->model_path = std::move(model_path);
     header_print("FLM", "Loading model: " << this->model_path);
     this->lm_config = std::make_unique<LM_Config>();
@@ -286,6 +289,8 @@ void AutoModel::_shared_load_backend(std::string model_path, json model_info,
 }
 
 void AutoModel::_shared_after_inference_failure(bool poisoned) {
+    system_prompt_cache_tokens_.clear();
+    system_prompt_cache_active_ = false;
     this->total_tokens = 0;
     this->last_token = -1;
     this->token_history.clear();
@@ -343,6 +348,71 @@ void AutoModel::_shared_validate_capacity(std::size_t rendered_tokens,
         if (normalized) message << " and requested output has " << *normalized << " tokens";
         throw ModelRequestError(400, false, message.str());
     }
+}
+
+std::vector<int> AutoModel::_system_prompt_prefix(lm_uniform_input_t& input, const std::vector<int>& tokens) {
+    flm::validate_system_prompt_cache_request(input.messages);
+    auto probe = [&](const std::string& text) {
+        json messages = json::array({input.messages.front(), {{"role", "user"}, {"content", text}}});
+        return tokenizer->encode(apply_chat_template(messages, input.tools));
+    };
+    return flm::system_prompt_prefix(probe("A"), probe("\xe4\xbd\xa0"), tokens);
+}
+
+bool AutoModel::_prepare_system_prompt_cache(chat_meta_info_t& meta_info,
+                                            std::vector<int> prefix,
+                                            std::function<bool()> is_cancelled) {
+    meta_info.restore_allowed = false;
+    meta_info.cached_prompt_tokens = 0;
+    meta_info.prefill_duration = 0;
+    if (!prefix.empty() && prefix == system_prompt_cache_tokens_) {
+        const int restored = lm_engine->restore();
+        if (restored == static_cast<int>(prefix.size())) {
+            total_tokens = restored;
+            token_history = prefix;
+            checkpoint_his = prefix;
+            last_token = -1;
+            sampler->reset_penalties();
+            reset_parser();
+            tool_name_.clear();
+            for (auto& profiler : profiler_list) profiler.reset();
+            meta_info.cached_prompt_tokens = restored;
+            return true;
+        }
+        header_print("WARNING", "System checkpoint length mismatch; rebuilding prefix.");
+    }
+    clear_context();
+    reset_parser();
+    tool_name_.clear();
+    system_prompt_cache_active_ = true;
+    if (prefix.empty()) return true;
+    if (is_cancelled()) {
+        meta_info.stop_reason = CANCEL_DETECTED;
+        return false;
+    }
+    if (prefix.size() >= MAX_L) return false;
+    const auto start = profiler_list[PREFILL_TIME].start();
+    // Prefill without sampling: consuming a sample here would change the RNG
+    // and penalty state of cold requests relative to cache hits.
+    _chunked_insert(meta_info, prefix, is_cancelled);
+    const auto end = profiler_list[PREFILL_TIME].stop(prefix.size());
+    meta_info.prefill_duration = static_cast<uint64_t>(time_utils::duration_ns(start, end).first);
+    if (meta_info.stop_reason == CANCEL_DETECTED || is_cancelled()) {
+        meta_info.stop_reason = CANCEL_DETECTED;
+        clear_context();
+        return false;
+    }
+    total_tokens = static_cast<uint32_t>(prefix.size());
+    token_history = prefix;
+    checkpoint_his = prefix;
+    if (lm_engine->checkpoint() != static_cast<int>(prefix.size())) {
+        // Do not claim a reusable checkpoint if the engine cannot represent it.
+        clear_context();
+        system_prompt_cache_active_ = true;
+        return true;
+    }
+    system_prompt_cache_tokens_ = std::move(prefix);
+    return true;
 }
 
 bool AutoModel::_shared_insert(chat_meta_info_t& meta_info, std::vector<int>& tokens, std::function<bool()> is_cancelled, void* payload, int first_len_run, std::optional<int> requested_max_new_tokens) {
@@ -712,6 +782,8 @@ StreamResult AutoModel::_shared_think_tool_calling_pasrsed(const std::string con
 /// \note The function will clear the context
 /// \note The function will reset the total tokens
 void AutoModel::clear_context() {
+    system_prompt_cache_tokens_.clear();
+    system_prompt_cache_active_ = false;
     this->total_tokens = 0;
     this->last_token = -1;
     this->token_history.clear();

@@ -40,6 +40,10 @@ struct gemma4e_engine_config_t {
 };
 
 class Gemma4e : public AutoModel {
+public:
+    bool supports_system_prompt_cache() const override {
+        return !single_turn && backend_ && backend_->id() == "flm";
+    }
 private:
     // some model specific template variables
     static constexpr int boi_token_id = 255999; // begin of image token id
